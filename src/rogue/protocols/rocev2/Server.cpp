@@ -3,41 +3,8 @@
  * Company    : SLAC National Accelerator Laboratory
  * ----------------------------------------------------------------------------
  * Description:
- * RoCEv2 Server
- *
- * Receives RDMA WRITE-with-Immediate operations from an FPGA and forwards
- * each one as a rogue ris::Frame into the downstream stream pipeline.
- *
- * Immediate value layout (host byte order after ntohl, which ibverbs applies):
- *
- *  31       8  7        0
- *  ┌─────────┬──────────┐
- *  │reserved │ channel  │
- *  │  (24b)  │   (8b)   │
- *  └─────────┴──────────┘
- *
- * Receive flow:
- *   Constructor
- *     → registers the pool slab as an MR
- *     → creates a UD QP and transitions it to RTS
- *     → pre-posts rxQueueDepth Receive Work Requests (RWRs)
- *     → launches the CQ-polling thread
- *
- *   runThread (CQ polling loop)
- *     → ibv_poll_cq() returns IBV_WC_RECV_RDMA_WITH_IMM
- *     → looks up the FramePtr by wr_id
- *     → sets payload length from wc.byte_len
- *     → sets channel from imm_data[7:0]
- *     → sets firstUser = 0x2 (SSI SOF, mandatory for rogue protocols)
- *     → calls sendFrame() to push frame downstream
- *     → allocates a fresh frame and re-posts its buffer as a new RWR
- *
- * UD QP details:
- *   - Q-Key: 0x11111111  (must match FPGA firmware)
- *   - The FPGA performs RDMA WRITEs targeting this QP's receive buffers.
- *     UD RDMA WRITE-with-Immediate requires the target to have a posted RWR;
- *     the 40-byte UD Global Routing Header (GRH) is prepended by the HCA and
- *     is skipped when reading payload (first 40 bytes are GRH).
+ * RoCEv2 RC Server implementation.
+ * See Server.h for the full connection sequence description.
  * ----------------------------------------------------------------------------
  **/
 #include "rogue/Directives.h"
@@ -46,17 +13,22 @@
 
 #include <infiniband/verbs.h>
 #include <stdint.h>
+#include <string.h>
 
-#include <cstring>
+#include <cstdlib>
+#include <iomanip>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "rogue/GeneralError.h"
 #include "rogue/GilRelease.h"
 #include "rogue/Logging.h"
 #include "rogue/interfaces/stream/Buffer.h"
 #include "rogue/interfaces/stream/Frame.h"
+#include "rogue/interfaces/stream/FrameIterator.h"
 #include "rogue/interfaces/stream/FrameLock.h"
 #include "rogue/protocols/rocev2/Core.h"
 
@@ -68,14 +40,8 @@ namespace ris = rogue::interfaces::stream;
 namespace bp = boost::python;
 #endif
 
-// UD GRH size prepended by the HCA on every UD receive
-static const uint32_t GrhSize = 40;
-
-// SSI Start-of-Frame bit in firstUser (bit 1)
+// SSI Start-of-Frame bit — set on every received frame
 static const uint8_t SsiSof = 0x02;
-
-// Q-Key for the UD QP - must match FPGA firmware
-static const uint32_t QKey = 0x11111111;
 
 // ---------------------------------------------------------------------------
 // Factory
@@ -85,13 +51,14 @@ rpr::ServerPtr rpr::Server::create(const std::string& deviceName,
                                    uint8_t            gidIndex,
                                    uint32_t           maxPayload,
                                    uint32_t           rxQueueDepth) {
-    rpr::ServerPtr r =
-        std::make_shared<rpr::Server>(deviceName, ibPort, gidIndex, maxPayload, rxQueueDepth);
-    return r;
+    return std::make_shared<rpr::Server>(
+        deviceName, ibPort, gidIndex, maxPayload, rxQueueDepth);
 }
 
 // ---------------------------------------------------------------------------
 // Constructor
+// Sets up ibverbs resources through QP INIT.
+// Does NOT start the receive thread — that happens in completeConnection().
 // ---------------------------------------------------------------------------
 rpr::Server::Server(const std::string& deviceName,
                     uint8_t            ibPort,
@@ -101,123 +68,225 @@ rpr::Server::Server(const std::string& deviceName,
     : rpr::Core(deviceName, ibPort, gidIndex, maxPayload),
       ris::Master(),
       ris::Slave(),
-      threadEn_(false),
-      nextWrId_(0) {
+      cq_(nullptr), qp_(nullptr), mr_(nullptr),
+      slab_(nullptr),
+      numBufs_(rxQueueDepth),
+      nextSlot_(0),
+      thread_(nullptr),
+      threadEn_(false) {
 
     log_ = rogue::Logging::create("rocev2.Server");
 
-    // -----------------------------------------------------------------------
-    // 1. Configure the rogue pool.
-    //    Each buffer must hold the GRH (40 B) plus the maximum payload.
-    // -----------------------------------------------------------------------
-    uint32_t bufSize = GrhSize + maxPayload_;
-    setFixedSize(bufSize);
-    setPoolSize(rxQueueDepth * 4);  // keep 4x headroom in the pool
+    // Initialise FPGA GID to zero — overwritten by setFpgaGid() before
+    // completeConnection() is called.
+    memset(fpgaGid_, 0, 16);
 
     // -----------------------------------------------------------------------
-    // 2. Register the pool memory with ibverbs.
-    //    We register a representative block here.  Because rogue's Pool
-    //    allocates individual buffers via malloc(), we register each buffer
-    //    individually when we post the RWR (see postRecvWr).  The MR pointer
-    //    stored in Core (mr_) is therefore per-buffer and managed in postRecvWr.
-    //    We set Core::mr_ = nullptr to signal "per-buffer registration" mode.
+    // 1. Allocate contiguous RX slab
+    //    RC QPs do not prepend a GRH, so each slot is exactly maxPayload_ bytes.
     // -----------------------------------------------------------------------
-    mr_ = nullptr;  // per-buffer MRs are managed in postRecvWr / runThread
+    bufSize_  = maxPayload_;
+    slabSize_ = numBufs_ * bufSize_;
+
+    slab_ = static_cast<uint8_t*>(aligned_alloc(4096, slabSize_));
+    if (!slab_)
+        throw(rogue::GeneralError::create("rocev2::Server::Server",
+                                          "Failed to allocate RX slab (%u bytes)",
+                                          slabSize_));
+    memset(slab_, 0, slabSize_);
+
+    // -----------------------------------------------------------------------
+    // 2. Register slab as a single MR
+    //    LOCAL_WRITE  — HCA can DMA incoming data into it
+    //    REMOTE_WRITE — FPGA can issue RDMA WRITEs targeting it
+    // -----------------------------------------------------------------------
+    mr_ = ibv_reg_mr(pd_, slab_, slabSize_,
+                     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    if (!mr_)
+        throw(rogue::GeneralError::create("rocev2::Server::Server",
+                                          "ibv_reg_mr failed"));
+
+    mrAddr_ = reinterpret_cast<uint64_t>(slab_);
+    mrRkey_ = mr_->rkey;
+
+    log_->info("MR: addr=0x%016" PRIx64 " rkey=0x%08x size=%u",
+               mrAddr_, mrRkey_, slabSize_);
 
     // -----------------------------------------------------------------------
     // 3. Create Completion Queue
-    //    Size = rxQueueDepth completions.  We poll it manually so no
-    //    completion channel is needed.
     // -----------------------------------------------------------------------
     cq_ = ibv_create_cq(ctx_,
-                         static_cast<int>(rxQueueDepth),
-                         nullptr,   // cq_context
-                         nullptr,   // completion channel (polling mode)
-                         0);        // comp_vector
+                         static_cast<int>(numBufs_),
+                         nullptr, nullptr, 0);
     if (!cq_)
         throw(rogue::GeneralError::create("rocev2::Server::Server",
-                                          "Failed to create completion queue"));
+                                          "ibv_create_cq failed"));
 
     // -----------------------------------------------------------------------
-    // 4. Create Unreliable Datagram Queue Pair
+    // 4. Create RC Queue Pair
     // -----------------------------------------------------------------------
     struct ibv_qp_init_attr qpAttr;
     memset(&qpAttr, 0, sizeof(qpAttr));
-    qpAttr.qp_type          = IBV_QPT_UD;
-    qpAttr.sq_sig_all        = 0;
-    qpAttr.send_cq           = cq_;   // not used for RX-only, but required
-    qpAttr.recv_cq           = cq_;
-    qpAttr.cap.max_recv_wr   = rxQueueDepth;
-    qpAttr.cap.max_send_wr   = 1;     // TX not used; minimal
-    qpAttr.cap.max_recv_sge  = 1;
-    qpAttr.cap.max_send_sge  = 1;
+    qpAttr.qp_type          = IBV_QPT_RC;
+    qpAttr.sq_sig_all       = 0;
+    qpAttr.send_cq          = cq_;
+    qpAttr.recv_cq          = cq_;
+    qpAttr.cap.max_recv_wr  = numBufs_;
+    qpAttr.cap.max_send_wr  = 1;
+    qpAttr.cap.max_recv_sge = 1;
+    qpAttr.cap.max_send_sge = 1;
 
     qp_ = ibv_create_qp(pd_, &qpAttr);
     if (!qp_)
         throw(rogue::GeneralError::create("rocev2::Server::Server",
-                                          "Failed to create queue pair"));
+                                          "ibv_create_qp (RC) failed"));
+
+    hostQpn_ = qp_->qp_num;
 
     // -----------------------------------------------------------------------
-    // 5. Transition QP: RESET → INIT → RTR → RTS
+    // 5. QP: RESET → INIT
     // -----------------------------------------------------------------------
-
-    // RESET → INIT
     {
         struct ibv_qp_attr attr;
         memset(&attr, 0, sizeof(attr));
-        attr.qp_state   = IBV_QPS_INIT;
-        attr.pkey_index = 0;
-        attr.port_num   = ibPort_;
-        attr.qkey       = QKey;
+        attr.qp_state        = IBV_QPS_INIT;
+        attr.pkey_index      = 0;
+        attr.port_num        = ibPort_;
+        attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE |
+                               IBV_ACCESS_REMOTE_READ  |
+                               IBV_ACCESS_LOCAL_WRITE;
 
         if (ibv_modify_qp(qp_, &attr,
-                          IBV_QP_STATE | IBV_QP_PKEY_INDEX |
-                          IBV_QP_PORT  | IBV_QP_QKEY))
+                          IBV_QP_STATE      |
+                          IBV_QP_PKEY_INDEX |
+                          IBV_QP_PORT       |
+                          IBV_QP_ACCESS_FLAGS))
             throw(rogue::GeneralError::create("rocev2::Server::Server",
-                                              "QP RESET→INIT transition failed"));
+                                              "QP RESET→INIT failed"));
     }
 
-    // INIT → RTR
+    // -----------------------------------------------------------------------
+    // 6. Read host GID
+    // -----------------------------------------------------------------------
+    union ibv_gid gid;
+    if (ibv_query_gid(ctx_, ibPort_, gidIndex_, &gid))
+        throw(rogue::GeneralError::create("rocev2::Server::Server",
+                                          "ibv_query_gid failed (port=%u idx=%u)",
+                                          ibPort_, gidIndex_));
+    memcpy(hostGid_, gid.raw, 16);
+
+    // -----------------------------------------------------------------------
+    // 7. Random starting PSNs
+    // -----------------------------------------------------------------------
+    hostRqPsn_ = static_cast<uint32_t>(random()) & 0xFFFFFF;
+    hostSqPsn_ = static_cast<uint32_t>(random()) & 0xFFFFFF;
+
+    log_->info("RC QP ready for handshake: qpn=0x%06x rqPsn=0x%06x sqPsn=0x%06x",
+               hostQpn_, hostRqPsn_, hostSqPsn_);
+    log_->info("Waiting for setFpgaGid() + completeConnection() ...");
+}
+
+// ---------------------------------------------------------------------------
+// setFpgaGid — store the FPGA GID derived from its IP address
+// Called by Python before completeConnection().
+// ---------------------------------------------------------------------------
+void rpr::Server::setFpgaGid(const std::vector<uint8_t>& gidBytes) {
+    if (gidBytes.size() != 16)
+        throw(rogue::GeneralError::create("rocev2::Server::setFpgaGid",
+                                          "GID must be exactly 16 bytes, got %zu",
+                                          gidBytes.size()));
+    memcpy(fpgaGid_, gidBytes.data(), 16);
+
+    log_->info("FPGA GID set: %02x%02x:%02x%02x:%02x%02x:%02x%02x:"
+               "%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+               fpgaGid_[0],  fpgaGid_[1],  fpgaGid_[2],  fpgaGid_[3],
+               fpgaGid_[4],  fpgaGid_[5],  fpgaGid_[6],  fpgaGid_[7],
+               fpgaGid_[8],  fpgaGid_[9],  fpgaGid_[10], fpgaGid_[11],
+               fpgaGid_[12], fpgaGid_[13], fpgaGid_[14], fpgaGid_[15]);
+}
+
+// ---------------------------------------------------------------------------
+// completeConnection — called by Python after FPGA QPN is known
+// Finishes QP INIT→RTR→RTS using the stored fpgaGid_, then starts RX thread.
+// ---------------------------------------------------------------------------
+void rpr::Server::completeConnection(uint32_t fpgaQpn, uint32_t fpgaRqPsn) {
+    log_->info("completeConnection: fpgaQpn=0x%06x fpgaRqPsn=0x%06x",
+               fpgaQpn, fpgaRqPsn);
+
+    // -----------------------------------------------------------------------
+    // QP: INIT → RTR
+    // -----------------------------------------------------------------------
+    {
+        union ibv_gid dgid;
+        memcpy(dgid.raw, fpgaGid_, 16);
+
+        struct ibv_qp_attr attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.qp_state              = IBV_QPS_RTR;
+        attr.path_mtu              = IBV_MTU_4096;
+        attr.dest_qp_num           = fpgaQpn;
+        attr.rq_psn                = fpgaRqPsn;
+        attr.max_dest_rd_atomic    = 16;
+        attr.min_rnr_timer         = 1;
+        attr.ah_attr.is_global     = 1;
+        attr.ah_attr.grh.dgid      = dgid;
+        attr.ah_attr.grh.sgid_index= gidIndex_;
+        attr.ah_attr.grh.hop_limit = 64;
+        attr.ah_attr.port_num      = ibPort_;
+        attr.ah_attr.sl            = 0;
+
+        if (ibv_modify_qp(qp_, &attr,
+                          IBV_QP_STATE              |
+                          IBV_QP_AV                 |
+                          IBV_QP_PATH_MTU           |
+                          IBV_QP_DEST_QPN           |
+                          IBV_QP_RQ_PSN             |
+                          IBV_QP_MAX_DEST_RD_ATOMIC |
+                          IBV_QP_MIN_RNR_TIMER))
+            throw(rogue::GeneralError::create("rocev2::Server::completeConnection",
+                                              "QP INIT→RTR failed"));
+    }
+
+    log_->info("QP → RTR");
+
+    // -----------------------------------------------------------------------
+    // QP: RTR → RTS
+    // -----------------------------------------------------------------------
     {
         struct ibv_qp_attr attr;
         memset(&attr, 0, sizeof(attr));
-        attr.qp_state = IBV_QPS_RTR;
+        attr.qp_state      = IBV_QPS_RTS;
+        attr.sq_psn        = hostSqPsn_;
+        attr.timeout       = 14;
+        attr.retry_cnt     = 3;
+        attr.rnr_retry     = 3;
+        attr.max_rd_atomic = 16;
 
-        if (ibv_modify_qp(qp_, &attr, IBV_QP_STATE))
-            throw(rogue::GeneralError::create("rocev2::Server::Server",
-                                              "QP INIT→RTR transition failed"));
+        if (ibv_modify_qp(qp_, &attr,
+                          IBV_QP_STATE            |
+                          IBV_QP_SQ_PSN           |
+                          IBV_QP_TIMEOUT          |
+                          IBV_QP_RETRY_CNT        |
+                          IBV_QP_RNR_RETRY        |
+                          IBV_QP_MAX_QP_RD_ATOMIC))
+            throw(rogue::GeneralError::create("rocev2::Server::completeConnection",
+                                              "QP RTR→RTS failed"));
     }
 
-    // RTR → RTS
-    {
-        struct ibv_qp_attr attr;
-        memset(&attr, 0, sizeof(attr));
-        attr.qp_state  = IBV_QPS_RTS;
-        attr.sq_psn    = 0;
-
-        if (ibv_modify_qp(qp_, &attr, IBV_QP_STATE | IBV_QP_SQ_PSN))
-            throw(rogue::GeneralError::create("rocev2::Server::Server",
-                                              "QP RTR→RTS transition failed"));
-    }
-
-    log_->info("RoCEv2 Server QP number: 0x%06x  Q-Key: 0x%08x  port: %u  GID idx: %u",
-               qp_->qp_num, QKey, ibPort_, gidIndex_);
+    log_->info("QP → RTS — host ready to receive RDMA WRITEs");
 
     // -----------------------------------------------------------------------
-    // 6. Pre-post rxQueueDepth receive work requests
+    // Pre-post all receive WRs
     // -----------------------------------------------------------------------
-    for (uint32_t i = 0; i < rxQueueDepth; ++i) {
-        ris::FramePtr frame = reqLocalFrame(bufSize, false);
-        postRecvWr(frame);
-    }
+    for (uint32_t i = 0; i < numBufs_; ++i) postRecvWr(i);
 
     // -----------------------------------------------------------------------
-    // 7. Start the receive thread
+    // Start receive thread
     // -----------------------------------------------------------------------
     std::shared_ptr<int> scopePtr = std::make_shared<int>(0);
-    threadEn_ = true;
-    thread_   = new std::thread(&rpr::Server::runThread, this,
-                                std::weak_ptr<int>(scopePtr));
+    threadEn_.store(true);
+    thread_ = new std::thread(&rpr::Server::runThread, this,
+                              std::weak_ptr<int>(scopePtr));
 
 #ifndef __MACH__
     pthread_setname_np(thread_->native_handle(), "RoCEv2Server");
@@ -225,89 +294,49 @@ rpr::Server::Server(const std::string& deviceName,
 }
 
 // ---------------------------------------------------------------------------
-// Destructor / stop
+// getGid — return host GID as "xxxx:xxxx:..." string
 // ---------------------------------------------------------------------------
-rpr::Server::~Server() {
-    this->stop();
-}
-
-void rpr::Server::stop() {
-    if (threadEn_) {
-        threadEn_ = false;
-        thread_->join();
-        delete thread_;
-        thread_ = nullptr;
+std::string rpr::Server::getGid() const {
+    std::ostringstream oss;
+    for (int i = 0; i < 16; i += 2) {
+        if (i) oss << ':';
+        oss << std::hex << std::setfill('0')
+            << std::setw(2) << static_cast<int>(hostGid_[i])
+            << std::setw(2) << static_cast<int>(hostGid_[i+1]);
     }
-
-    // Tear down ibverbs resources in reverse order
-    if (qp_) { ibv_destroy_qp(qp_);   qp_ = nullptr; }
-    if (cq_) { ibv_destroy_cq(cq_);   cq_ = nullptr; }
-
-    // Deregister any MRs that are still in the wr map
-    {
-        std::lock_guard<std::mutex> lock(wrMapMtx_);
-        for (auto& kv : wrMap_) {
-            // The MR laddr is stored as wr_id; retrieve the mr pointer
-            // from the SGE lkey lookup is not straightforward here.
-            // Instead we store MRs in a parallel map - see postRecvWr.
-        }
-        wrMap_.clear();
-    }
+    return oss.str();
 }
 
 // ---------------------------------------------------------------------------
-// Post a single receive work request
+// postRecvWr — post one receive WR for slot `slot`
+// wr_id == slot index so no map lookup is needed on completion
 // ---------------------------------------------------------------------------
-void rpr::Server::postRecvWr(ris::FramePtr frame) {
-    ris::BufferPtr buff = *(frame->beginBuffer());
+void rpr::Server::postRecvWr(uint32_t slot) {
+    uint8_t* bufStart = slab_ + (static_cast<uint64_t>(slot) * bufSize_);
 
-    // Register this buffer's memory with the HCA.
-    // We use IBV_ACCESS_LOCAL_WRITE so the HCA can write incoming data into it.
-    struct ibv_mr* mr = ibv_reg_mr(pd_,
-                                   buff->begin(),
-                                   buff->getAvailable(),
-                                   IBV_ACCESS_LOCAL_WRITE);
-    if (!mr)
-        throw(rogue::GeneralError::create("rocev2::Server::postRecvWr",
-                                          "ibv_reg_mr failed"));
-
-    // Scatter/Gather entry pointing at the full buffer
     struct ibv_sge sge;
     memset(&sge, 0, sizeof(sge));
-    sge.addr   = reinterpret_cast<uint64_t>(buff->begin());
-    sge.length = buff->getAvailable();
-    sge.lkey   = mr->lkey;
+    sge.addr   = reinterpret_cast<uint64_t>(bufStart);
+    sge.length = bufSize_;
+    sge.lkey   = mr_->lkey;
 
-    // Work Request
     struct ibv_recv_wr wr;
     memset(&wr, 0, sizeof(wr));
-
-    uint64_t wrId = nextWrId_++;
-    wr.wr_id   = wrId;
+    wr.wr_id   = static_cast<uint64_t>(slot);
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.next    = nullptr;
 
-    // Store the frame and MR so runThread can retrieve them on completion
-    {
-        std::lock_guard<std::mutex> lock(wrMapMtx_);
-        wrMap_[wrId] = frame;
-        mrMap_[wrId] = mr;
-    }
-
     struct ibv_recv_wr* bad = nullptr;
     if (ibv_post_recv(qp_, &wr, &bad))
         throw(rogue::GeneralError::create("rocev2::Server::postRecvWr",
-                                          "ibv_post_recv failed"));
-
-    log_->debug("Posted RWR id=%" PRIu64, wrId);
+                                          "ibv_post_recv failed (slot=%u)", slot));
 }
 
 // ---------------------------------------------------------------------------
-// Receive thread - polls the CQ
+// runThread — CQ polling loop
 // ---------------------------------------------------------------------------
 void rpr::Server::runThread(std::weak_ptr<int> lockPtr) {
-    // Wait for the constructor to finish (scopePtr goes out of scope)
     while (!lockPtr.expired()) continue;
 
     log_->logThreadId();
@@ -315,134 +344,89 @@ void rpr::Server::runThread(std::weak_ptr<int> lockPtr) {
 
     struct ibv_wc wc;
 
-    while (threadEn_) {
-        // Busy-poll the completion queue.
-        // For lower CPU usage you can replace this with ibv_get_cq_event()
-        // using a completion channel - at the cost of higher latency.
+    while (threadEn_.load()) {
         int n = ibv_poll_cq(cq_, 1, &wc);
+        if (n == 0)  continue;
+        if (n < 0) { log_->warning("ibv_poll_cq error"); continue; }
 
-        if (n == 0) continue;
+        uint32_t slot = static_cast<uint32_t>(wc.wr_id);
 
-        if (n < 0) {
-            log_->warning("ibv_poll_cq returned error");
-            continue;
-        }
-
-        // ------------------------------------------------------------------
-        // Retrieve the pre-posted frame associated with this completion
-        // ------------------------------------------------------------------
-        ris::FramePtr frame;
-        struct ibv_mr* mr = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(wrMapMtx_);
-            auto it = wrMap_.find(wc.wr_id);
-            if (it == wrMap_.end()) {
-                log_->warning("Completion for unknown wr_id=%" PRIu64, wc.wr_id);
-                continue;
-            }
-            frame = it->second;
-            wrMap_.erase(it);
-
-            // Retrieve companion MR (see mrMap_ parallel map)
-            auto mit = mrMap_.find(wc.wr_id);
-            if (mit != mrMap_.end()) {
-                mr = mit->second;
-                mrMap_.erase(mit);
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // Handle errors
-        // ------------------------------------------------------------------
         if (wc.status != IBV_WC_SUCCESS) {
-            log_->warning("CQ completion error: %s (wr_id=%" PRIu64 ")",
-                          ibv_wc_status_str(wc.status), wc.wr_id);
-
-            // Deregister the MR and re-post a fresh buffer
-            if (mr) ibv_dereg_mr(mr);
-            ris::FramePtr fresh = reqLocalFrame(GrhSize + maxPayload_, false);
-            postRecvWr(fresh);
+            log_->warning("CQ error: %s (slot=%u)",
+                          ibv_wc_status_str(wc.status), slot);
+            postRecvWr(slot);
             continue;
         }
 
-        // ------------------------------------------------------------------
-        // We only expect RDMA WRITE-with-Immediate completions
-        // ------------------------------------------------------------------
         if (wc.opcode != IBV_WC_RECV_RDMA_WITH_IMM) {
-            log_->warning("Unexpected opcode %d, dropping", wc.opcode);
-            if (mr) ibv_dereg_mr(mr);
-            ris::FramePtr fresh = reqLocalFrame(GrhSize + maxPayload_, false);
-            postRecvWr(fresh);
+            log_->warning("Unexpected opcode %d (slot=%u)", wc.opcode, slot);
+            postRecvWr(slot);
             continue;
         }
 
         // ------------------------------------------------------------------
-        // Decode the immediate value
-        //
-        //  bits [7:0]  = channel id
-        //  bits [31:8] = reserved
-        //
-        // ibverbs delivers imm_data in host byte order (already ntohl'd).
+        // Decode immediate value
+        //   bits [7:0]  = channel id
+        //   bits [31:8] = reserved
         // ------------------------------------------------------------------
-        uint8_t channel = static_cast<uint8_t>(wc.imm_data & 0xFF);
+        uint8_t  channel    = static_cast<uint8_t>(wc.imm_data & 0xFF);
+        uint32_t payloadLen = wc.byte_len;
 
-        // ------------------------------------------------------------------
-        // The UD GRH (40 bytes) is prepended by the HCA.  Actual payload
-        // starts at offset 40.  wc.byte_len includes the GRH.
-        // ------------------------------------------------------------------
-        uint32_t totalLen   = wc.byte_len;
-        uint32_t payloadLen = (totalLen > GrhSize) ? (totalLen - GrhSize) : 0;
-
-        if (payloadLen == 0) {
-            log_->warning("Zero-length payload after GRH strip, dropping");
-            if (mr) ibv_dereg_mr(mr);
-            ris::FramePtr fresh = reqLocalFrame(GrhSize + maxPayload_, false);
-            postRecvWr(fresh);
+        if (payloadLen == 0 || payloadLen > bufSize_) {
+            log_->warning("Bad payload len=%u (slot=%u)", payloadLen, slot);
+            postRecvWr(slot);
             continue;
         }
 
         // ------------------------------------------------------------------
-        // Adjust the frame: skip GRH, set payload length
+        // Copy payload from slab slot into a rogue-owned frame, then
+        // immediately re-post the slot so the QP never starves.
         // ------------------------------------------------------------------
-        ris::BufferPtr buff = *(frame->beginBuffer());
-
-        // Move the buffer start pointer past the GRH.
-        // rogue Buffer tracks payload via setPayload(); we shift the begin
-        // pointer by adjusting the header size (which rogue calls "head room").
-        buff->setHeadRoom(GrhSize);
-        buff->setPayload(payloadLen);
-
-        // Set rogue stream metadata
+        ris::FramePtr frame = reqLocalFrame(payloadLen, false);
+        frame->setPayload(payloadLen);
         frame->setChannel(channel);
-        frame->setFirstUser(SsiSof);   // SSI SOF on every frame
+        frame->setFirstUser(SsiSof);
         frame->setLastUser(0);
 
-        log_->debug("RX frame: channel=%" PRIu8 " len=%" PRIu32, channel, payloadLen);
+        {
+            rogue::GilRelease noGil;
+            ris::FrameLockPtr lock = frame->lock();
+            ris::FrameIterator dst = frame->begin();
+            uint8_t* src = slab_ + (static_cast<uint64_t>(slot) * bufSize_);
+            ris::toFrame(dst, payloadLen, src);
+        }
 
-        // ------------------------------------------------------------------
-        // Push the frame into the rogue pipeline
-        // ------------------------------------------------------------------
+        log_->debug("RX slot=%u channel=%u len=%u", slot, channel, payloadLen);
+
+        postRecvWr(slot);   // re-post before sendFrame to avoid starvation
         sendFrame(frame);
-
-        // ------------------------------------------------------------------
-        // Deregister the consumed MR and post a fresh buffer in its place
-        // ------------------------------------------------------------------
-        if (mr) ibv_dereg_mr(mr);
-
-        ris::FramePtr fresh = reqLocalFrame(GrhSize + maxPayload_, false);
-        postRecvWr(fresh);
     }
 
     log_->info("RoCEv2 receive thread stopped");
 }
 
 // ---------------------------------------------------------------------------
-// acceptFrame - TX path (not implemented for RX-only server)
+// acceptFrame — TX not supported
 // ---------------------------------------------------------------------------
 void rpr::Server::acceptFrame(ris::FramePtr frame) {
-    log_->warning("RoCEv2 Server::acceptFrame called but TX is not supported. "
-                  "Dropping frame.");
+    log_->warning("RoCEv2 Server::acceptFrame: TX not supported, dropping");
 }
+
+// ---------------------------------------------------------------------------
+// stop / destructor
+// ---------------------------------------------------------------------------
+void rpr::Server::stop() {
+    if (threadEn_.load()) {
+        threadEn_.store(false);
+        if (thread_) { thread_->join(); delete thread_; thread_ = nullptr; }
+    }
+    if (qp_)   { ibv_destroy_qp(qp_);  qp_   = nullptr; }
+    if (cq_)   { ibv_destroy_cq(cq_);  cq_   = nullptr; }
+    if (mr_)   { ibv_dereg_mr(mr_);    mr_   = nullptr; }
+    if (slab_) { free(slab_);          slab_ = nullptr; }
+}
+
+rpr::Server::~Server() { this->stop(); }
 
 // ---------------------------------------------------------------------------
 // Python bindings
@@ -456,12 +440,21 @@ void rpr::Server::setup_python() {
         "Server",
         bp::init<std::string, uint8_t, uint8_t, uint32_t, uint32_t>(
             (bp::arg("deviceName"),
-             bp::arg("ibPort")      = 1,
-             bp::arg("gidIndex")    = 0,
-             bp::arg("maxPayload")  = rpr::DefaultMaxPayload,
-             bp::arg("rxQueueDepth") = rpr::DefaultRxQueueDepth)))
-        .def("create",   &rpr::Server::create)
-        .staticmethod("create");
+             bp::arg("ibPort")        = 1,
+             bp::arg("gidIndex")      = 0,
+             bp::arg("maxPayload")    = rpr::DefaultMaxPayload,
+             bp::arg("rxQueueDepth")  = rpr::DefaultRxQueueDepth)))
+        .def("create",             &rpr::Server::create)
+        .staticmethod("create")
+        .def("setFpgaGid",         &rpr::Server::setFpgaGid)
+        .def("completeConnection", &rpr::Server::completeConnection)
+        .def("getQpn",             &rpr::Server::getQpn)
+        .def("getGid",             &rpr::Server::getGid)
+        .def("getRqPsn",           &rpr::Server::getRqPsn)
+        .def("getSqPsn",           &rpr::Server::getSqPsn)
+        .def("getMrAddr",          &rpr::Server::getMrAddr)
+        .def("getMrRkey",          &rpr::Server::getMrRkey)
+        .def("stop",               &rpr::Server::stop);
 
     bp::implicitly_convertible<rpr::ServerPtr, rpr::CorePtr>();
     bp::implicitly_convertible<rpr::ServerPtr, ris::MasterPtr>();

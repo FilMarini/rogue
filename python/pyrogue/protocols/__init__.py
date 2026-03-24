@@ -9,6 +9,7 @@
 # copied, modified, propagated, or distributed except according to the terms
 # contained in the LICENSE.txt file.
 #-----------------------------------------------------------------------------
-from pyrogue.protocols._Network import *
-from pyrogue.protocols._RoCEv2  import *
-from pyrogue.protocols._uart import *
+from pyrogue.protocols._Network     import *
+from pyrogue.protocols._RoCEv2      import *
+from pyrogue.protocols._RoceEngine  import *
+from pyrogue.protocols._uart        import *
