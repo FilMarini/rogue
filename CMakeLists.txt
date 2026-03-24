@@ -266,7 +266,9 @@ include_directories(system ${BZIP2_INCLUDE_DIR})
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 add_library(rogue-core OBJECT "")
 
-# Find rogue core sources
+# Find rogue core sources.
+# NOTE: the rocev2 subdirectory sets IBVERBS_LIBRARY in PARENT_SCOPE
+# so it is available for linking below once rogue-core-shared is defined.
 add_subdirectory(src/rogue)
 
 # Always build shared library
@@ -282,6 +284,12 @@ set_target_properties(rogue-core-shared PROPERTIES VERSION ${ROGUE_VERSION} SOVE
 TARGET_LINK_LIBRARIES(rogue-core-shared PUBLIC ${Boost_LIBRARIES})
 TARGET_LINK_LIBRARIES(rogue-core-shared PUBLIC ${ZeroMQ_LIBRARY})
 TARGET_LINK_LIBRARIES(rogue-core-shared PUBLIC ${BZIP2_LIBRARIES})
+
+# Link ibverbs if the rocev2 submodule found it (IBVERBS_LIBRARY set via PARENT_SCOPE)
+# Not applicable on Apple — RoCEv2 / libibverbs is Linux-only
+if (IBVERBS_LIBRARY AND NOT APPLE)
+   TARGET_LINK_LIBRARIES(rogue-core-shared PUBLIC ${IBVERBS_LIBRARY})
+endif()
 
 # Do not link directly against python in mac os
 if (APPLE)
@@ -301,6 +309,12 @@ if(STATIC_LIB)
     TARGET_LINK_LIBRARIES(rogue-core-static PUBLIC ${ZeroMQ_LIBRARY})
     TARGET_LINK_LIBRARIES(rogue-core-static PUBLIC ${BZIP2_LIBRARIES})
     TARGET_LINK_LIBRARIES(rogue-core-static PUBLIC ${Python3_LIBRARIES})
+
+    # Link ibverbs into the static library too (Linux only)
+    if (IBVERBS_LIBRARY AND NOT APPLE)
+       TARGET_LINK_LIBRARIES(rogue-core-static PUBLIC ${IBVERBS_LIBRARY})
+    endif()
+
     if (NOT APPLE)
        TARGET_LINK_LIBRARIES(rogue-core-static PUBLIC rt)
     endif()
@@ -448,6 +462,14 @@ message("")
 message("-- Found ZeroMq: ${ZeroMQ_INCLUDE_DIR}")
 message("")
 message("-- Found Bzip2: ${BZIP2_INCLUDE_DIR}")
+message("")
+
+if (IBVERBS_LIBRARY AND NOT APPLE)
+   message("-- Found libibverbs: ${IBVERBS_LIBRARY} (RoCEv2 enabled)")
+else()
+   message("-- libibverbs not found (RoCEv2 disabled)")
+endif()
+
 message("")
 message("-- Link dynamic rogue library!")
 

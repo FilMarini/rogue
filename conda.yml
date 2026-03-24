@@ -31,3 +31,4 @@ dependencies:
   - pytest
   - pytest-cov
   - pyqt>=5.15
+  - rdma-core

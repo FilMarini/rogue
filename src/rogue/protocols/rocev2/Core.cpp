@@ -103,5 +103,11 @@ void rpr::Core::setup_python() {
 #ifndef NO_PYTHON
     bp::class_<rpr::Core, rpr::CorePtr, boost::noncopyable>("Core", bp::no_init)
         .def("maxPayload", &rpr::Core::maxPayload);
+
+    // Expose defaults as module-level attributes:
+    //   rogue.protocols.rocev2.DefaultMaxPayload
+    //   rogue.protocols.rocev2.DefaultRxQueueDepth
+    bp::scope().attr("DefaultMaxPayload")   = rpr::DefaultMaxPayload;
+    bp::scope().attr("DefaultRxQueueDepth") = rpr::DefaultRxQueueDepth;
 #endif
 }
