@@ -3,8 +3,22 @@
  * Company    : SLAC National Accelerator Laboratory
  * ----------------------------------------------------------------------------
  * Description:
- * RoCEv2 RC Server implementation.
- * See Server.h for the full connection sequence description.
+ * RoCEv2 RC Server — zero-copy receive path.
+ *
+ * Zero-copy design
+ * ----------------
+ * The slab is registered as a single MR.  On each CQ completion the
+ * relevant slot is wrapped as a rogue Buffer using createBuffer() — this
+ * records the existing pointer without any allocation or copy.  The Buffer
+ * meta field carries the slot index in its lower 24 bits.
+ *
+ * When the last FramePtr downstream releases its reference, Buffer::~Buffer()
+ * calls retBuffer() on this Pool subclass.  retBuffer() extracts the slot
+ * index from meta and re-posts that slot to the QP — completing the cycle
+ * without any data movement.
+ *
+ * This pattern is identical to AxiStreamDma's zero-copy path (see
+ * AxiStreamDma.cpp retBuffer / createBuffer usage).
  * ----------------------------------------------------------------------------
  **/
 #include "rogue/Directives.h"
@@ -28,7 +42,6 @@
 #include "rogue/Logging.h"
 #include "rogue/interfaces/stream/Buffer.h"
 #include "rogue/interfaces/stream/Frame.h"
-#include "rogue/interfaces/stream/FrameIterator.h"
 #include "rogue/interfaces/stream/FrameLock.h"
 #include "rogue/protocols/rocev2/Core.h"
 
@@ -40,7 +53,7 @@ namespace ris = rogue::interfaces::stream;
 namespace bp = boost::python;
 #endif
 
-// SSI Start-of-Frame bit — set on every received frame
+// SSI Start-of-Frame bit set on every received frame
 static const uint8_t SsiSof = 0x02;
 
 // ---------------------------------------------------------------------------
@@ -57,8 +70,8 @@ rpr::ServerPtr rpr::Server::create(const std::string& deviceName,
 
 // ---------------------------------------------------------------------------
 // Constructor
-// Sets up ibverbs resources through QP INIT.
-// Does NOT start the receive thread — that happens in completeConnection().
+// ibverbs setup through QP INIT.  Receive thread starts in
+// completeConnection() once the FPGA QPN is known.
 // ---------------------------------------------------------------------------
 rpr::Server::Server(const std::string& deviceName,
                     uint8_t            ibPort,
@@ -71,19 +84,15 @@ rpr::Server::Server(const std::string& deviceName,
       cq_(nullptr), qp_(nullptr), mr_(nullptr),
       slab_(nullptr),
       numBufs_(rxQueueDepth),
-      nextSlot_(0),
       thread_(nullptr),
       threadEn_(false) {
 
     log_ = rogue::Logging::create("rocev2.Server");
-
-    // Initialise FPGA GID to zero — overwritten by setFpgaGid() before
-    // completeConnection() is called.
     memset(fpgaGid_, 0, 16);
 
     // -----------------------------------------------------------------------
-    // 1. Allocate contiguous RX slab
-    //    RC QPs do not prepend a GRH, so each slot is exactly maxPayload_ bytes.
+    // 1. Allocate slab
+    //    RC QPs do not prepend a GRH so each slot is exactly maxPayload_.
     // -----------------------------------------------------------------------
     bufSize_  = maxPayload_;
     slabSize_ = numBufs_ * bufSize_;
@@ -97,8 +106,6 @@ rpr::Server::Server(const std::string& deviceName,
 
     // -----------------------------------------------------------------------
     // 2. Register slab as a single MR
-    //    LOCAL_WRITE  — HCA can DMA incoming data into it
-    //    REMOTE_WRITE — FPGA can issue RDMA WRITEs targeting it
     // -----------------------------------------------------------------------
     mr_ = ibv_reg_mr(pd_, slab_, slabSize_,
                      IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
@@ -171,8 +178,7 @@ rpr::Server::Server(const std::string& deviceName,
     union ibv_gid gid;
     if (ibv_query_gid(ctx_, ibPort_, gidIndex_, &gid))
         throw(rogue::GeneralError::create("rocev2::Server::Server",
-                                          "ibv_query_gid failed (port=%u idx=%u)",
-                                          ibPort_, gidIndex_));
+                                          "ibv_query_gid failed"));
     memcpy(hostGid_, gid.raw, 16);
 
     // -----------------------------------------------------------------------
@@ -181,41 +187,30 @@ rpr::Server::Server(const std::string& deviceName,
     hostRqPsn_ = static_cast<uint32_t>(random()) & 0xFFFFFF;
     hostSqPsn_ = static_cast<uint32_t>(random()) & 0xFFFFFF;
 
-    log_->info("RC QP ready for handshake: qpn=0x%06x rqPsn=0x%06x sqPsn=0x%06x",
+    log_->info("RC QP ready: qpn=0x%06x rqPsn=0x%06x sqPsn=0x%06x",
                hostQpn_, hostRqPsn_, hostSqPsn_);
-    log_->info("Waiting for setFpgaGid() + completeConnection() ...");
 }
 
 // ---------------------------------------------------------------------------
-// setFpgaGid — store the FPGA GID derived from its IP address
-// Called by Python before completeConnection().
+// setFpgaGid
 // ---------------------------------------------------------------------------
 void rpr::Server::setFpgaGid(const std::vector<uint8_t>& gidBytes) {
     if (gidBytes.size() != 16)
         throw(rogue::GeneralError::create("rocev2::Server::setFpgaGid",
-                                          "GID must be exactly 16 bytes, got %zu",
+                                          "GID must be 16 bytes, got %zu",
                                           gidBytes.size()));
     memcpy(fpgaGid_, gidBytes.data(), 16);
-
-    log_->info("FPGA GID set: %02x%02x:%02x%02x:%02x%02x:%02x%02x:"
-               "%02x%02x:%02x%02x:%02x%02x:%02x%02x",
-               fpgaGid_[0],  fpgaGid_[1],  fpgaGid_[2],  fpgaGid_[3],
-               fpgaGid_[4],  fpgaGid_[5],  fpgaGid_[6],  fpgaGid_[7],
-               fpgaGid_[8],  fpgaGid_[9],  fpgaGid_[10], fpgaGid_[11],
-               fpgaGid_[12], fpgaGid_[13], fpgaGid_[14], fpgaGid_[15]);
+    log_->info("FPGA GID stored");
 }
 
 // ---------------------------------------------------------------------------
-// completeConnection — called by Python after FPGA QPN is known
-// Finishes QP INIT→RTR→RTS using the stored fpgaGid_, then starts RX thread.
+// completeConnection — finish handshake and start receive thread
 // ---------------------------------------------------------------------------
-void rpr::Server::completeConnection(uint32_t fpgaQpn, uint32_t fpgaRqPsn) {
+void rpr::Server::completeConnection(uint32_t fpgaQpn, uint32_t fpgaRqPsn, uint32_t pmtu) {
     log_->info("completeConnection: fpgaQpn=0x%06x fpgaRqPsn=0x%06x",
                fpgaQpn, fpgaRqPsn);
 
-    // -----------------------------------------------------------------------
     // QP: INIT → RTR
-    // -----------------------------------------------------------------------
     {
         union ibv_gid dgid;
         memcpy(dgid.raw, fpgaGid_, 16);
@@ -223,7 +218,7 @@ void rpr::Server::completeConnection(uint32_t fpgaQpn, uint32_t fpgaRqPsn) {
         struct ibv_qp_attr attr;
         memset(&attr, 0, sizeof(attr));
         attr.qp_state              = IBV_QPS_RTR;
-        attr.path_mtu              = IBV_MTU_4096;
+        attr.path_mtu              = static_cast<ibv_mtu>(pmtu);
         attr.dest_qp_num           = fpgaQpn;
         attr.rq_psn                = fpgaRqPsn;
         attr.max_dest_rd_atomic    = 16;
@@ -249,9 +244,7 @@ void rpr::Server::completeConnection(uint32_t fpgaQpn, uint32_t fpgaRqPsn) {
 
     log_->info("QP → RTR");
 
-    // -----------------------------------------------------------------------
     // QP: RTR → RTS
-    // -----------------------------------------------------------------------
     {
         struct ibv_qp_attr attr;
         memset(&attr, 0, sizeof(attr));
@@ -273,16 +266,12 @@ void rpr::Server::completeConnection(uint32_t fpgaQpn, uint32_t fpgaRqPsn) {
                                               "QP RTR→RTS failed"));
     }
 
-    log_->info("QP → RTS — host ready to receive RDMA WRITEs");
+    log_->info("QP → RTS — ready to receive RDMA WRITEs");
 
-    // -----------------------------------------------------------------------
     // Pre-post all receive WRs
-    // -----------------------------------------------------------------------
     for (uint32_t i = 0; i < numBufs_; ++i) postRecvWr(i);
 
-    // -----------------------------------------------------------------------
     // Start receive thread
-    // -----------------------------------------------------------------------
     std::shared_ptr<int> scopePtr = std::make_shared<int>(0);
     threadEn_.store(true);
     thread_ = new std::thread(&rpr::Server::runThread, this,
@@ -294,7 +283,7 @@ void rpr::Server::completeConnection(uint32_t fpgaQpn, uint32_t fpgaRqPsn) {
 }
 
 // ---------------------------------------------------------------------------
-// getGid — return host GID as "xxxx:xxxx:..." string
+// getGid
 // ---------------------------------------------------------------------------
 std::string rpr::Server::getGid() const {
     std::ostringstream oss;
@@ -308,8 +297,8 @@ std::string rpr::Server::getGid() const {
 }
 
 // ---------------------------------------------------------------------------
-// postRecvWr — post one receive WR for slot `slot`
-// wr_id == slot index so no map lookup is needed on completion
+// postRecvWr — post a receive WR for slot `slot`
+// wr_id == slot index so no lookup is needed on completion
 // ---------------------------------------------------------------------------
 void rpr::Server::postRecvWr(uint32_t slot) {
     uint8_t* bufStart = slab_ + (static_cast<uint64_t>(slot) * bufSize_);
@@ -334,13 +323,42 @@ void rpr::Server::postRecvWr(uint32_t slot) {
 }
 
 // ---------------------------------------------------------------------------
-// runThread — CQ polling loop
+// retBuffer — zero-copy hook
+//
+// Called by Buffer::~Buffer() when the last FramePtr holding this slot is
+// released by downstream.  We re-post the slot to the QP so the FPGA can
+// write into it again.
+//
+// meta lower 24 bits = slot index (set in createBuffer() call in runThread)
+// ---------------------------------------------------------------------------
+void rpr::Server::retBuffer(uint8_t* data, uint32_t meta, uint32_t rawSize) {
+    // Extract slot index from lower 24 bits of meta
+    uint32_t slot = meta & 0x00FFFFFF;
+
+    log_->debug("retBuffer: re-posting slot=%u", slot);
+
+    // Re-post the slot to the QP — no lock needed, ibv_post_recv is thread-safe
+    // If the QP is already destroyed (during shutdown) just update counters
+    if (threadEn_.load() && qp_) {
+        try {
+            postRecvWr(slot);
+        } catch (...) {
+            // Swallow errors during shutdown
+        }
+    }
+
+    // Update pool accounting — mirrors AxiStreamDma::retBuffer pattern
+    decCounter(rawSize);
+}
+
+// ---------------------------------------------------------------------------
+// runThread — CQ polling loop (zero-copy version)
 // ---------------------------------------------------------------------------
 void rpr::Server::runThread(std::weak_ptr<int> lockPtr) {
     while (!lockPtr.expired()) continue;
 
     log_->logThreadId();
-    log_->info("RoCEv2 receive thread started");
+    log_->info("RoCEv2 receive thread started (zero-copy)");
 
     struct ibv_wc wc;
 
@@ -354,12 +372,14 @@ void rpr::Server::runThread(std::weak_ptr<int> lockPtr) {
         if (wc.status != IBV_WC_SUCCESS) {
             log_->warning("CQ error: %s (slot=%u)",
                           ibv_wc_status_str(wc.status), slot);
+            // Re-post so we don't permanently lose a slot
             postRecvWr(slot);
             continue;
         }
 
         if (wc.opcode != IBV_WC_RECV_RDMA_WITH_IMM) {
-            log_->warning("Unexpected opcode %d (slot=%u)", wc.opcode, slot);
+            log_->warning("Unexpected opcode %d (slot=%u), re-posting",
+                          wc.opcode, slot);
             postRecvWr(slot);
             continue;
         }
@@ -373,32 +393,41 @@ void rpr::Server::runThread(std::weak_ptr<int> lockPtr) {
         uint32_t payloadLen = wc.byte_len;
 
         if (payloadLen == 0 || payloadLen > bufSize_) {
-            log_->warning("Bad payload len=%u (slot=%u)", payloadLen, slot);
+            log_->warning("Bad payload len=%u (slot=%u), re-posting",
+                          payloadLen, slot);
             postRecvWr(slot);
             continue;
         }
 
         // ------------------------------------------------------------------
-        // Copy payload from slab slot into a rogue-owned frame, then
-        // immediately re-post the slot so the QP never starves.
+        // Zero-copy: wrap the slab slot directly as a rogue Buffer.
+        //
+        // createBuffer() records the existing pointer — no allocation, no
+        // copy.  The slot index is stored in the lower 24 bits of meta so
+        // retBuffer() can re-post it when downstream is done.
+        //
+        // NOTE: we do NOT call postRecvWr() here.  retBuffer() does it
+        // when the last downstream reference is released.
         // ------------------------------------------------------------------
-        ris::FramePtr frame = reqLocalFrame(payloadLen, false);
-        frame->setPayload(payloadLen);
+        uint8_t* slotPtr = slab_ + (static_cast<uint64_t>(slot) * bufSize_);
+
+        // meta = slot index in lower 24 bits
+        ris::BufferPtr buff = createBuffer(slotPtr,
+                                           slot & 0x00FFFFFF,
+                                           payloadLen,
+                                           bufSize_);
+        buff->setPayload(payloadLen);
+
+        ris::FramePtr frame = ris::Frame::create();
+        frame->appendBuffer(buff);
         frame->setChannel(channel);
         frame->setFirstUser(SsiSof);
         frame->setLastUser(0);
 
-        {
-            rogue::GilRelease noGil;
-            ris::FrameLockPtr lock = frame->lock();
-            ris::FrameIterator dst = frame->begin();
-            uint8_t* src = slab_ + (static_cast<uint64_t>(slot) * bufSize_);
-            ris::toFrame(dst, payloadLen, src);
-        }
+        log_->debug("RX slot=%u channel=%u len=%u (zero-copy)",
+                    slot, channel, payloadLen);
 
-        log_->debug("RX slot=%u channel=%u len=%u", slot, channel, payloadLen);
-
-        postRecvWr(slot);   // re-post before sendFrame to avoid starvation
+        // Push frame downstream — slot stays live until frame is released
         sendFrame(frame);
     }
 
@@ -447,7 +476,7 @@ void rpr::Server::setup_python() {
         .def("create",             &rpr::Server::create)
         .staticmethod("create")
         .def("setFpgaGid",         &rpr::Server::setFpgaGid)
-        .def("completeConnection", &rpr::Server::completeConnection)
+        .def("completeConnection", &rpr::Server::completeConnection, (bp::arg("fpgaQpn"), bp::arg("fpgaRqPsn"), bp::arg("pmtu")=5))
         .def("getQpn",             &rpr::Server::getQpn)
         .def("getGid",             &rpr::Server::getGid)
         .def("getRqPsn",           &rpr::Server::getRqPsn)
