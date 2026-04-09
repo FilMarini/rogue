@@ -465,6 +465,7 @@ def _roce_setup_connection(engine, host_qpn, host_rq_psn, host_sq_psn,
         log.info("=" * 60)
         log.info("RoCEv2 FPGA connection summary")
         log.info(f"  FPGA QPN    : 0x{fpga_qpn:06x}")
+        log.info(f"  FPGA lkey   : 0x{lkey:08x}")
         log.info(f"  FPGA state  : RTS (ready to send RDMA WRITEs)")
         log.info(f"  Host QPN    : 0x{host_qpn:06x}")
         log.info(f"  Host RQ PSN : 0x{host_rq_psn:06x}")
@@ -474,7 +475,7 @@ def _roce_setup_connection(engine, host_qpn, host_rq_psn, host_sq_psn,
         log.info(f"  Path MTU    : {pmtu} ({[256,512,1024,2048,4096][pmtu-1]} bytes)")
         log.info("=" * 60)
 
-    return fpga_qpn
+    return fpga_qpn, lkey
 
 
 # ---------------------------------------------------------------------------
@@ -602,6 +603,40 @@ class RoCEv2Server(pr.Device):
             name='ConnectionState', mode='RO', value='Disconnected',
             description='RC connection state'))
 
+        self.add(pr.LocalVariable(
+            name        = 'HostRqPsn',
+            description = 'Host starting receive PSN — FPGA SQ PSN must match this',
+            mode        = 'RO',
+            value       = 0,
+            typeStr     = 'UInt32',
+            localGet    = lambda: self._server.getRqPsn(),
+        ))
+
+        self.add(pr.LocalVariable(
+            name        = 'HostSqPsn',
+            description = 'Host starting send PSN — FPGA RQ PSN must match this',
+            mode        = 'RO',
+            value       = 0,
+            typeStr     = 'UInt32',
+            localGet    = lambda: self._server.getSqPsn(),
+        ))
+
+        self.add(pr.LocalVariable(
+            name        = 'FpgaQpn',
+            description = 'FPGA QP number — set after RC connection is established',
+            mode        = 'RO',
+            value       = 0,
+            typeStr     = 'UInt32',
+        ))
+
+        self.add(pr.LocalVariable(
+            name        = 'FpgaLkey',
+            description = 'FPGA MR local key — set after RC connection is established',
+            mode        = 'RO',
+            value       = 0,
+            typeStr     = 'UInt32',
+        ))
+
     @property
     def stream(self):
         """Direct access to the C++ stream master (mirrors rudp.application(0))."""
@@ -635,7 +670,7 @@ class RoCEv2Server(pr.Device):
         _engine  = self._extRoceEngine if self._extRoceEngine is not None \
                    else self.RoceEngine
 
-        fpga_qpn = _roce_setup_connection(
+        fpga_qpn, fpga_lkey = _roce_setup_connection(
             engine      = _engine,
             host_qpn    = host_qpn,
             host_rq_psn = host_rq_psn,
@@ -652,6 +687,8 @@ class RoCEv2Server(pr.Device):
             pmtu      = self._pmtu,
         )
 
+        self.FpgaQpn.set(fpga_qpn)
+        self.FpgaLkey.set(fpga_lkey)
         self.ConnectionState.set('Connected')
         self._log.info("=" * 60)
         self._log.info("RoCEv2 host RC connection summary")
@@ -663,6 +700,7 @@ class RoCEv2Server(pr.Device):
         self._log.info(f"  MR rkey     : 0x{self._server.getMrRkey():08x}")
         self._log.info(f"  MR size     : {mr_len} bytes  ({self._rxQueueDepth} slots x {self._maxPayload} bytes)")
         self._log.info(f"  FPGA QPN    : 0x{fpga_qpn:06x}")
+        self._log.info(f"  FPGA lkey   : 0x{fpga_lkey:08x}")
         self._log.info(f"  FPGA GID    : {_gid_bytes_to_str(self._fpgaGidBytes)}")
         self._log.info(f"  Path MTU    : {self._pmtu} ({[256,512,1024,2048,4096][self._pmtu-1]} bytes)")
         self._log.info(f"  RC connection established — ready to receive RDMA WRITEs")
