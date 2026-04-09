@@ -194,12 +194,12 @@ rpr::Server::Server(const std::string& deviceName,
 // ---------------------------------------------------------------------------
 // setFpgaGid
 // ---------------------------------------------------------------------------
-void rpr::Server::setFpgaGid(const std::vector<uint8_t>& gidBytes) {
+void rpr::Server::setFpgaGid(const std::string& gidBytes) {
     if (gidBytes.size() != 16)
         throw(rogue::GeneralError::create("rocev2::Server::setFpgaGid",
                                           "GID must be 16 bytes, got %zu",
                                           gidBytes.size()));
-    memcpy(fpgaGid_, gidBytes.data(), 16);
+    memcpy(fpgaGid_, gidBytes.c_str(), 16);
     log_->info("FPGA GID stored");
 }
 

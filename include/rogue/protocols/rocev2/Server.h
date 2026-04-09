@@ -137,7 +137,7 @@ class Server : public rogue::protocols::rocev2::Core,
     ~Server();
     void stop();
 
-    void setFpgaGid(const std::vector<uint8_t>& gidBytes);
+    void setFpgaGid(const std::string& gidBytes);
     void completeConnection(uint32_t fpgaQpn, uint32_t fpgaRqPsn, uint32_t pmtu = 5);
 
     uint32_t    getQpn()    const { return hostQpn_; }
