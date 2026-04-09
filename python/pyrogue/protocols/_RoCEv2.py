@@ -461,6 +461,19 @@ def _roce_setup_connection(engine, host_qpn, host_rq_psn, host_sq_psn,
         f"FPGA QP→RTS failed (ok={ok} state={state})"
     info("RoceEngine: QP → RTS — FPGA ready to send RDMA WRITEs")
 
+    if log:
+        log.info("=" * 60)
+        log.info("RoCEv2 FPGA connection summary")
+        log.info(f"  FPGA QPN    : 0x{fpga_qpn:06x}")
+        log.info(f"  FPGA state  : RTS (ready to send RDMA WRITEs)")
+        log.info(f"  Host QPN    : 0x{host_qpn:06x}")
+        log.info(f"  Host RQ PSN : 0x{host_rq_psn:06x}")
+        log.info(f"  Host SQ PSN : 0x{host_sq_psn:06x}")
+        log.info(f"  MR addr     : 0x{mr_laddr:016x}")
+        log.info(f"  MR length   : {mr_len} bytes")
+        log.info(f"  Path MTU    : {pmtu} ({[256,512,1024,2048,4096][pmtu-1]} bytes)")
+        log.info("=" * 60)
+
     return fpga_qpn
 
 
@@ -640,10 +653,20 @@ class RoCEv2Server(pr.Device):
         )
 
         self.ConnectionState.set('Connected')
-        self._log.info(
-            f"RoCEv2 '{self.name}': RC connection established — "
-            f"FPGA QPN=0x{fpga_qpn:06x}"
-        )
+        self._log.info("=" * 60)
+        self._log.info("RoCEv2 host RC connection summary")
+        self._log.info(f"  Device      : {self._deviceName}  port={self._ibPort}  GID idx={self._gidIndex}")
+        self._log.info(f"  Host QPN    : 0x{host_qpn:06x}")
+        self._log.info(f"  Host GID    : {self._server.getGid()}")
+        self._log.info(f"  Host state  : RTS")
+        self._log.info(f"  MR addr     : 0x{mr_addr:016x}")
+        self._log.info(f"  MR rkey     : 0x{self._server.getMrRkey():08x}")
+        self._log.info(f"  MR size     : {mr_len} bytes  ({self._rxQueueDepth} slots x {self._maxPayload} bytes)")
+        self._log.info(f"  FPGA QPN    : 0x{fpga_qpn:06x}")
+        self._log.info(f"  FPGA GID    : {_gid_bytes_to_str(self._fpgaGidBytes)}")
+        self._log.info(f"  Path MTU    : {self._pmtu} ({[256,512,1024,2048,4096][self._pmtu-1]} bytes)")
+        self._log.info(f"  RC connection established — ready to receive RDMA WRITEs")
+        self._log.info("=" * 60)
 
         super()._start()
 
