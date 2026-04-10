@@ -604,6 +604,22 @@ class RoCEv2Server(pr.Device):
             description='RC connection state'))
 
         self.add(pr.LocalVariable(
+            name        = 'MaxPayload',
+            description = 'Max payload bytes per RDMA WRITE slot',
+            mode        = 'RO',
+            value       = maxPayload,
+            typeStr     = 'UInt32',
+        ))
+
+        self.add(pr.LocalVariable(
+            name        = 'RxQueueDepth',
+            description = 'Number of receive slots (rxQueueDepth)',
+            mode        = 'RO',
+            value       = rxQueueDepth,
+            typeStr     = 'UInt32',
+        ))
+
+        self.add(pr.LocalVariable(
             name        = 'HostRqPsn',
             description = 'Host starting receive PSN — FPGA SQ PSN must match this',
             mode        = 'RO',
