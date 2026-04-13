@@ -222,7 +222,10 @@ def _encode_create_qp(pd_handler):
 
 
 def _encode_modify_qp(qpn, attr_mask, qp_state, pmtu,
-                      dqpn=0, rq_psn=0, sq_psn=0):
+                      dqpn=0, rq_psn=0, sq_psn=0,
+                      min_rnr_timer=_DEFAULT_RNR_TIMER,
+                      rnr_retry=_DEFAULT_RETRY_NUM,
+                      retry_count=_DEFAULT_RETRY_NUM):
     """reqQp.getBus() for MODIFY — same field order as CREATE."""
     meta = _BS()
     meta.append(_BS(uint=_REQ_QP_MODIFY, length=_QP_REQTYPE_B))
@@ -244,10 +247,10 @@ def _encode_modify_qp(qpn, attr_mask, qp_state, pmtu,
         (0,                  _QPA_SQDRAINING_B),
         (_MAX_QP_RD_ATOM,    _QPA_MAXREADATOMIC_B),
         (_MAX_QP_RD_ATOM,    _QPA_MAXDESTRD_B),
-        (_DEFAULT_RNR_TIMER, _QPA_RNRTIMER_B),
+        (min_rnr_timer,      _QPA_RNRTIMER_B),
         (_DEFAULT_TIMEOUT,   _QPA_TIMEOUT_B),
-        (_DEFAULT_RETRY_NUM, _QPA_RETRYCNT_B),
-        (_DEFAULT_RETRY_NUM, _QPA_RNRRETRY_B),
+        (retry_count,        _QPA_RETRYCNT_B),
+        (rnr_retry,          _QPA_RNRRETRY_B),
     ]:
         meta.append(_BS(uint=int(value), length=width))
     meta.append(_BS(uint=_IBV_QPT_RC, length=_QPI_TYPE_B))
@@ -377,7 +380,8 @@ def _wait_resp(engine, timeout_s=5.0):
 # ---------------------------------------------------------------------------
 
 def _roce_setup_connection(engine, host_qpn, host_rq_psn, host_sq_psn,
-                           mr_laddr, mr_len, pmtu, log=None):
+                           mr_laddr, mr_len, pmtu, min_rnr_timer=1,
+                           rnr_retry=7, retry_count=3, log=None):
     """
     Drive any RoceEngine-compatible object (surf or our own) through:
     PD alloc → MR alloc → QP create → INIT → RTR → RTS.
@@ -454,7 +458,9 @@ def _roce_setup_connection(engine, host_qpn, host_rq_psn, host_sq_psn,
     rts_mask = (_IBV_QP_STATE | _IBV_QP_SQ_PSN | _IBV_QP_TIMEOUT |
                 _IBV_QP_RETRY_CNT | _IBV_QP_RNR_RETRY | _IBV_QP_MAX_QP_RD_ATOMIC)
     _send_meta(engine, _encode_modify_qp(
-        fpga_qpn, rts_mask, _IBV_QPS_RTS, pmtu, sq_psn=host_sq_psn))
+        fpga_qpn, rts_mask, _IBV_QPS_RTS, pmtu,
+        sq_psn=host_sq_psn, min_rnr_timer=min_rnr_timer,
+        rnr_retry=rnr_retry, retry_count=retry_count))
     rx = _wait_resp(engine)
     ok, _, state = _decode_qp_resp(rx)
     assert ok and state == _IBV_QPS_RTS, \
@@ -529,6 +535,9 @@ class RoCEv2Server(pr.Device):
         roceMemBase:      object = None,
         roceEngine:       object = None,
         pmtu:             int    = 5,
+        minRnrTimer:      int    = 31,   # IB spec: 31 = 491ms, 1 = 0.01ms
+        rnrRetry:         int    = 7,    # FPGA RNR retry count (7 = infinite)
+        retryCount:       int    = 3,    # FPGA retry count for other errors
         pollInterval:     int    = 1,
         **kwargs: Any,
     ) -> None:
@@ -541,6 +550,9 @@ class RoCEv2Server(pr.Device):
         self._maxPayload    = maxPayload
         self._rxQueueDepth  = rxQueueDepth
         self._pmtu          = pmtu
+        self._minRnrTimer   = minRnrTimer
+        self._rnrRetry      = rnrRetry
+        self._retryCount    = retryCount
         self._extRoceEngine = roceEngine
         self._fpgaGidBytes  = _ip_to_gid_bytes(ip)
 
@@ -687,20 +699,24 @@ class RoCEv2Server(pr.Device):
                    else self.RoceEngine
 
         fpga_qpn, fpga_lkey = _roce_setup_connection(
-            engine      = _engine,
-            host_qpn    = host_qpn,
-            host_rq_psn = host_rq_psn,
-            host_sq_psn = host_sq_psn,
-            mr_laddr    = mr_addr,
-            mr_len      = mr_len,
-            pmtu        = self._pmtu,
-            log         = self._log,
+            engine        = _engine,
+            host_qpn      = host_qpn,
+            host_rq_psn   = host_rq_psn,
+            host_sq_psn   = host_sq_psn,
+            mr_laddr      = mr_addr,
+            mr_len        = mr_len,
+            pmtu          = self._pmtu,
+            min_rnr_timer = self._minRnrTimer,
+            rnr_retry     = self._rnrRetry,
+            retry_count   = self._retryCount,
+            log           = self._log,
         )
 
         self._server.completeConnection(
-            fpgaQpn   = fpga_qpn,
-            fpgaRqPsn = host_sq_psn,
-            pmtu      = self._pmtu,
+            fpgaQpn     = fpga_qpn,
+            fpgaRqPsn   = host_sq_psn,
+            pmtu        = self._pmtu,
+            minRnrTimer = self._minRnrTimer,
         )
 
         self.FpgaQpn.set(fpga_qpn)
@@ -719,6 +735,9 @@ class RoCEv2Server(pr.Device):
         self._log.info(f"  FPGA lkey   : 0x{fpga_lkey:08x}")
         self._log.info(f"  FPGA GID    : {_gid_bytes_to_str(self._fpgaGidBytes)}")
         self._log.info(f"  Path MTU    : {self._pmtu} ({[256,512,1024,2048,4096][self._pmtu-1]} bytes)")
+        self._log.info(f"  MinRnrTimer : {self._minRnrTimer}")
+        self._log.info(f"  RnrRetry    : {self._rnrRetry}")
+        self._log.info(f"  RetryCount  : {self._retryCount}")
         self._log.info(f"  RC connection established — ready to receive RDMA WRITEs")
         self._log.info("=" * 60)
 

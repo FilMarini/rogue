@@ -22,7 +22,7 @@
  *   Step 3 — setFpgaGid(gidBytes)
  *     Stores FPGA GID derived from IP address.
  *
- *   Step 4 — completeConnection(fpgaQpn, fpgaRqPsn)
+ *   Step 4 — completeConnection(fpgaQpn, fpgaRqPsn, pmtu, minRnrTimer)
  *     Transitions host QP INIT→RTR→RTS, pre-posts all receive WRs,
  *     starts the CQ-polling receive thread.
  *
@@ -45,6 +45,13 @@
  * Immediate value format (bits):
  *   [7:0]  = channel id
  *   [31:8] = reserved
+ *
+ * RNR timer
+ * ---------
+ *   minRnrTimer is set on the host QP during RTR transition.  It is
+ *   embedded in every RNR NAK the host sends to the FPGA, telling the
+ *   FPGA the minimum time it must wait before retrying.
+ *   IB spec values: 1=0.01ms  14=1ms  18=4ms  22=16ms  31=491ms
  * ----------------------------------------------------------------------------
  **/
 
@@ -109,6 +116,10 @@ class Server : public rogue::protocols::rocev2::Core,
 
     std::shared_ptr<rogue::Logging> log_;
 
+    // RX counters
+    std::atomic<uint64_t> frameCount_;
+    std::atomic<uint64_t> byteCount_;
+
     void postRecvWr(uint32_t slot);
     void runThread(std::weak_ptr<int> lockPtr);
 
@@ -138,14 +149,22 @@ class Server : public rogue::protocols::rocev2::Core,
     void stop();
 
     void setFpgaGid(const std::string& gidBytes);
-    void completeConnection(uint32_t fpgaQpn, uint32_t fpgaRqPsn, uint32_t pmtu = 5);
 
-    uint32_t    getQpn()    const { return hostQpn_; }
-    std::string getGid()    const;
-    uint32_t    getRqPsn()  const { return hostRqPsn_; }
-    uint32_t    getSqPsn()  const { return hostSqPsn_; }
-    uint64_t    getMrAddr() const { return mrAddr_; }
-    uint32_t    getMrRkey() const { return mrRkey_; }
+    // minRnrTimer: IB spec RNR timer code embedded in RNR NAK packets.
+    //   1=0.01ms  14=1ms  18=4ms  22=16ms  31=491ms
+    void completeConnection(uint32_t fpgaQpn,
+                            uint32_t fpgaRqPsn,
+                            uint32_t pmtu        = 5,
+                            uint32_t minRnrTimer = 1);
+
+    uint32_t    getQpn()        const { return hostQpn_; }
+    std::string getGid()        const;
+    uint32_t    getRqPsn()      const { return hostRqPsn_; }
+    uint32_t    getSqPsn()      const { return hostSqPsn_; }
+    uint64_t    getMrAddr()     const { return mrAddr_; }
+    uint32_t    getMrRkey()     const { return mrRkey_; }
+    uint64_t    getFrameCount() const { return frameCount_.load(); }
+    uint64_t    getByteCount()  const { return byteCount_.load(); }
 
     void acceptFrame(rogue::interfaces::stream::FramePtr frame) override;
 
