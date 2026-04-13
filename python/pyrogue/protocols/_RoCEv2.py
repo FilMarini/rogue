@@ -77,14 +77,20 @@ _METADATA_MR_T = 1
 _METADATA_QP_T = 2
 
 # QP request types
-_REQ_QP_CREATE = 0
-_REQ_QP_MODIFY = 2
+_REQ_QP_CREATE  = 0
+_REQ_QP_DESTROY = 1
+_REQ_QP_MODIFY  = 2
+_REQ_QP_QUERY   = 3   # kept for completeness, not currently used
 
 # QP types / states
-_IBV_QPT_RC  = 2
-_IBV_QPS_INIT = 1
-_IBV_QPS_RTR  = 2
-_IBV_QPS_RTS  = 3
+_IBV_QPT_RC    = 2
+_IBV_QPS_RESET  = 0
+_IBV_QPS_INIT   = 1
+_IBV_QPS_RTR    = 2
+_IBV_QPS_RTS    = 3
+_IBV_QPS_SQD    = 4
+_IBV_QPS_ERR    = 6
+_IBV_QPS_CREATE = 8
 
 # QP attribute mask bits
 _IBV_QP_STATE             = 1
@@ -305,16 +311,15 @@ def _decode_pd_resp(rx):
 def _decode_mr_resp(rx):
     """
     Decode MR allocation response.
-    Returns (success: bool, lkey: int).
+    Returns (success: bool, lkey: int, rkey: int).
+    From respMr.__init__: rKey at [31:0], lKey at [63:32].
     """
-    # successOrNot bit position from respMr.__init__:
-    # MR_RKEY_B + MR_LKEY_B + MR_RKEYPART_B + MR_LKEYPART_B
-    # + MR_PDHANDLER_B + MR_ACCFLAGS_B + MR_LEN_B + MR_LADDR_B
     success_bit = (_MR_KEY_B + _MR_KEY_B + _MR_RKEYPART_B + _MR_LKEYPART_B +
                    _MR_PDHANDLER_B + _MR_ACCFLAGS_B + _MR_LEN_B + _MR_LADDR_B)
     success = bool((rx >> success_bit) & 1)
+    rkey    = rx & ((1 << _MR_KEY_B) - 1)
     lkey    = (rx >> _MR_KEY_B) & ((1 << _MR_KEY_B) - 1)
-    return success, lkey
+    return success, lkey, rkey
 
 
 def _decode_qp_resp(rx):
@@ -376,6 +381,128 @@ def _wait_resp(engine, timeout_s=5.0):
 
 
 # ---------------------------------------------------------------------------
+# QP teardown / reconnect helpers
+# ---------------------------------------------------------------------------
+
+def _encode_dealloc_mr(pd_handler, lkey, rkey):
+    """Dealloc MR: allocOrNot=0, same field layout as alloc."""
+    meta = _BS()
+    meta.append(_BS(uint=0,          length=_MR_ALLOC_OR_NOT_B))  # allocOrNot=0
+    meta.append(_BS(uint=0,          length=_MR_LADDR_B))
+    meta.append(_BS(uint=0,          length=_MR_LEN_B))
+    meta.append(_BS(uint=0,          length=_MR_ACCFLAGS_B))
+    meta.append(_BS(uint=pd_handler, length=_MR_PDHANDLER_B))
+    meta.append(_BS(uint=0,          length=_MR_LKEYPART_B))
+    meta.append(_BS(uint=0,          length=_MR_RKEYPART_B))
+    meta.append(_BS(uint=0,          length=_MR_LKEYORNOT_B))
+    meta.append(_BS(uint=lkey,       length=_MR_KEY_B))
+    meta.append(_BS(uint=rkey,       length=_MR_KEY_B))
+    full = _BS(_META_DATA_TX_BITS - meta.length)
+    full.append(meta)
+    full.overwrite(_BS(uint=_METADATA_MR_T, length=2), pos=0)
+    return full.uint
+
+
+def _encode_dealloc_pd(pd_handler):
+    """Dealloc PD: allocOrNot=0."""
+    meta = _BS()
+    meta.append(_BS(uint=0,          length=_PD_ALLOC_OR_NOT_B))  # allocOrNot=0
+    meta.append(_BS(uint=0,          length=_PD_KEY_B))
+    meta.append(_BS(uint=pd_handler, length=_PD_HANDLER_B))
+    full = _BS(_META_DATA_TX_BITS - meta.length)
+    full.append(meta)
+    full.overwrite(_BS(uint=_METADATA_PD_T, length=2), pos=0)
+    return full.uint
+
+
+def _encode_err_qp(qpn):
+    """REQ_QP_MODIFY → IBV_QPS_ERR — only IBV_QP_STATE in attr mask."""
+    return _encode_modify_qp(qpn, _IBV_QP_STATE, _IBV_QPS_ERR, 1)
+
+
+def _encode_destroy_qp(qpn):
+    """REQ_QP_DESTROY — only valid from ERR state."""
+    meta = _BS()
+    meta.append(_BS(uint=_REQ_QP_DESTROY, length=_QP_REQTYPE_B))
+    meta.append(_BS(uint=0,               length=_QP_PDHANDLER_B))
+    meta.append(_BS(uint=qpn,             length=_QP_QPN_B))
+    meta.append(_BS(uint=0,               length=_QP_ATTRMASK_B))
+    for w in [_QPA_QPSTATE_B, _QPA_CURRQPSTATE_B, _QPA_PMTU_B,
+              _QPA_QKEY_B, _QPA_RQPSN_B, _QPA_SQPSN_B, _QPA_DQPN_B,
+              _QPA_QPACCFLAGS_B, _QPA_CAP_B, _QPA_PKEY_B,
+              _QPA_SQDRAINING_B, _QPA_MAXREADATOMIC_B, _QPA_MAXDESTRD_B,
+              _QPA_RNRTIMER_B, _QPA_TIMEOUT_B, _QPA_RETRYCNT_B,
+              _QPA_RNRRETRY_B, _QPI_TYPE_B, _QPI_SQSIGALL_B]:
+        meta.append(_BS(uint=0, length=w))
+    full = _BS(_META_DATA_TX_BITS - meta.length)
+    full.append(meta)
+    full.overwrite(_BS(uint=_METADATA_QP_T, length=2), pos=0)
+    return full.uint
+
+
+def _roce_teardown(engine, fpga_qpn, pd_handler=0, lkey=0, rkey=0, log=None):
+    """
+    Full FPGA resource teardown: QP ERR → DESTROY → MR dealloc → PD dealloc.
+
+    Sends all requests unconditionally — the firmware rejects them with
+    successOrNot=False if resources are already freed, which we ignore.
+    All errors are caught and logged as warnings.
+    """
+    def warn(msg):
+        if log:
+            log.warning(msg)
+    def info(msg):
+        if log:
+            log.info(msg)
+
+    engine.SendMetaData.set(0)
+    _time.sleep(0.1)
+
+    # Step 1: QP → ERR
+    info(f"RoceEngine: teardown — sending ERR for QP 0x{fpga_qpn:06x}")
+    _send_meta(engine, _encode_err_qp(fpga_qpn))
+    try:
+        rx = _wait_resp(engine, timeout_s=3.0)
+        ok, _, state = _decode_qp_resp(rx)
+        info(f"RoceEngine: ERR response ok={ok} state={state}")
+    except RuntimeError:
+        warn("RoceEngine: ERR timed out — proceeding anyway")
+
+    # Step 2: QP DESTROY
+    info(f"RoceEngine: teardown — sending DESTROY for QP 0x{fpga_qpn:06x}")
+    _send_meta(engine, _encode_destroy_qp(fpga_qpn))
+    try:
+        rx = _wait_resp(engine, timeout_s=5.0)
+        ok, _, _ = _decode_qp_resp(rx)
+        info(f"RoceEngine: DESTROY response ok={ok}")
+    except RuntimeError:
+        warn("RoceEngine: DESTROY timed out — proceeding anyway")
+
+    # Step 3: MR dealloc (only if we have the keys)
+    if pd_handler != 0:
+        info(f"RoceEngine: teardown — dealloc MR lkey=0x{lkey:08x}")
+        _send_meta(engine, _encode_dealloc_mr(pd_handler, lkey, rkey))
+        try:
+            rx = _wait_resp(engine, timeout_s=3.0)
+            ok, _, _ = _decode_mr_resp(rx)
+            info(f"RoceEngine: MR dealloc response ok={ok}")
+        except RuntimeError:
+            warn("RoceEngine: MR dealloc timed out — proceeding anyway")
+
+        # Step 4: PD dealloc
+        info(f"RoceEngine: teardown — dealloc PD handler=0x{pd_handler:08x}")
+        _send_meta(engine, _encode_dealloc_pd(pd_handler))
+        try:
+            rx = _wait_resp(engine, timeout_s=3.0)
+            ok, _ = _decode_pd_resp(rx)
+            info(f"RoceEngine: PD dealloc response ok={ok}")
+        except RuntimeError:
+            warn("RoceEngine: PD dealloc timed out — proceeding anyway")
+
+    _time.sleep(0.1)
+
+
+# ---------------------------------------------------------------------------
 # Full FPGA connection sequence
 # ---------------------------------------------------------------------------
 
@@ -386,11 +513,11 @@ def _roce_setup_connection(engine, host_qpn, host_rq_psn, host_sq_psn,
     Drive any RoceEngine-compatible object (surf or our own) through:
     PD alloc → MR alloc → QP create → INIT → RTR → RTS.
 
-    Works with both surf.ethernet.roce._RoceEngine.RoceEngine and
-    pyrogue.protocols._RoceEngine.RoceEngine since both expose the same
-    registers: SendMetaData, MetaDataTx, RecvMetaData, MetaDataRx.
+    The FPGA is expected to be in a clean state (QP destroyed, PD freed)
+    before this is called. Teardown is handled in _stop() so the firmware
+    is always clean when rogue exits.
 
-    Returns the FPGA QPN.
+    Returns (fpga_qpn, lkey).
     """
     def info(msg):
         if log:
@@ -420,9 +547,9 @@ def _roce_setup_connection(engine, host_qpn, host_rq_psn, host_sq_psn,
     rx = _wait_resp(engine)
     assert _decode_resp_type(rx) == _METADATA_MR_T, \
         f"Expected MR response (type=1), got type={_decode_resp_type(rx)}"
-    ok, lkey = _decode_mr_resp(rx)
+    ok, lkey, rkey = _decode_mr_resp(rx)
     assert ok, "FPGA MR allocation failed"
-    info(f"RoceEngine: MR allocated lkey=0x{lkey:08x}")
+    info(f"RoceEngine: MR allocated lkey=0x{lkey:08x} rkey=0x{rkey:08x}")
 
     # 3. Create QP (RC)
     _send_meta(engine, _encode_create_qp(pd_handler))
@@ -481,7 +608,7 @@ def _roce_setup_connection(engine, host_qpn, host_rq_psn, host_sq_psn,
         log.info(f"  Path MTU    : {pmtu} ({[256,512,1024,2048,4096][pmtu-1]} bytes)")
         log.info("=" * 60)
 
-    return fpga_qpn, lkey
+    return fpga_qpn, lkey, pd_handler, rkey
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +681,10 @@ class RoCEv2Server(pr.Device):
         self._rnrRetry      = rnrRetry
         self._retryCount    = retryCount
         self._extRoceEngine = roceEngine
+        self._fpga_qpn        = 0   # set after successful connection
+        self._fpga_pd_handler = 0
+        self._fpga_lkey       = 0
+        self._fpga_rkey       = 0
         self._fpgaGidBytes  = _ip_to_gid_bytes(ip)
 
         # C++ RC server — ibverbs resources up to QP INIT
@@ -698,7 +829,7 @@ class RoCEv2Server(pr.Device):
         _engine  = self._extRoceEngine if self._extRoceEngine is not None \
                    else self.RoceEngine
 
-        fpga_qpn, fpga_lkey = _roce_setup_connection(
+        fpga_qpn, fpga_lkey, fpga_pd_handler, fpga_rkey = _roce_setup_connection(
             engine        = _engine,
             host_qpn      = host_qpn,
             host_rq_psn   = host_rq_psn,
@@ -719,6 +850,10 @@ class RoCEv2Server(pr.Device):
             minRnrTimer = self._minRnrTimer,
         )
 
+        self._fpga_qpn      = fpga_qpn    # shadow for teardown
+        self._fpga_pd_handler = fpga_pd_handler
+        self._fpga_lkey     = fpga_lkey
+        self._fpga_rkey     = fpga_rkey
         self.FpgaQpn.set(fpga_qpn)
         self.FpgaLkey.set(fpga_lkey)
         self.ConnectionState.set('Connected')
@@ -742,6 +877,30 @@ class RoCEv2Server(pr.Device):
         self._log.info("=" * 60)
 
         super()._start()
+
+    def teardownFpgaQp(self) -> None:
+        """
+        Tear down the FPGA QP via the metadata bus.
+        Called explicitly from Root.stop() before the transport is torn down.
+        """
+        fpga_qpn = self._fpga_qpn
+        if fpga_qpn == 0:
+            return
+        _engine = self._extRoceEngine if self._extRoceEngine is not None                   else self.RoceEngine
+        try:
+            self._log.info(
+                f"RoCEv2 '{self.name}': tearing down FPGA QP 0x{fpga_qpn:06x}")
+            _roce_teardown(_engine, fpga_qpn,
+                           pd_handler = self._fpga_pd_handler,
+                           lkey       = self._fpga_lkey,
+                           rkey       = self._fpga_rkey,
+                           log        = self._log)
+            self._fpga_qpn        = 0
+            self._fpga_pd_handler = 0
+            self._fpga_lkey       = 0
+            self._fpga_rkey       = 0
+        except Exception as e:
+            self._log.warning(f"RoCEv2 teardown failed: {e}")
 
     def _stop(self) -> None:
         self._server.stop()
