@@ -45,6 +45,12 @@ project (rogue)
 
 option(ROGUE_BUILD_TESTS "Build Rogue native C++ tests" OFF)
 
+# ----------------------------------------------------------------------------
+# RoCEv2 / RDMA support — Linux only, requires libibverbs from rdma-core.
+# Enable with:  cmake .. -DROCEV2=ON
+# ----------------------------------------------------------------------------
+option(ROCEV2 "Enable RoCEv2 RDMA receive support (requires libibverbs / rdma-core)" OFF)
+
 # Current Apple support target is arm64 only.
 if (APPLE AND NOT ((CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64") OR (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")))
    message(FATAL_ERROR "macOS builds are only supported on arm64")
@@ -124,6 +130,32 @@ endif()
 # BZIP2
 #####################################
 find_package(BZip2 QUIET REQUIRED)
+
+
+#####################################
+# libibverbs (RoCEv2 / RDMA — Linux only)
+#####################################
+if (ROCEV2)
+   if (APPLE)
+      message(FATAL_ERROR "ROCEV2=ON is not supported on macOS (libibverbs is Linux-only)")
+   endif()
+
+   find_library(IBVERBS_LIBRARY NAMES ibverbs
+                HINTS ${CMAKE_PREFIX_PATH}/lib ENV LD_LIBRARY_PATH)
+   find_path(IBVERBS_INCLUDE_DIR NAMES infiniband/verbs.h
+             HINTS ${CMAKE_PREFIX_PATH}/include)
+
+   if (NOT IBVERBS_LIBRARY OR NOT IBVERBS_INCLUDE_DIR)
+      message(FATAL_ERROR
+         "ROCEV2=ON but libibverbs not found.\n"
+         "Install rdma-core via conda:  conda install -c conda-forge rdma-core\n"
+         "or via apt:                   sudo apt install libibverbs-dev")
+   endif()
+
+   message(STATUS "RoCEv2 enabled -- libibverbs: ${IBVERBS_LIBRARY}")
+   include_directories(system ${IBVERBS_INCLUDE_DIR})
+   add_definitions(-DROCEV2_ENABLED)
+endif()
 
 
 #####################################
@@ -289,9 +321,8 @@ TARGET_LINK_LIBRARIES(rogue-core-shared PUBLIC ${Boost_LIBRARIES})
 TARGET_LINK_LIBRARIES(rogue-core-shared PUBLIC ${ZeroMQ_LIBRARY})
 TARGET_LINK_LIBRARIES(rogue-core-shared PUBLIC ${BZIP2_LIBRARIES})
 
-# Link ibverbs if the rocev2 submodule found it (IBVERBS_LIBRARY set via PARENT_SCOPE)
-# Not applicable on Apple — RoCEv2 / libibverbs is Linux-only
-if (IBVERBS_LIBRARY AND NOT APPLE)
+# Link ibverbs if ROCEV2=ON (Linux only)
+if (ROCEV2 AND NOT APPLE)
    TARGET_LINK_LIBRARIES(rogue-core-shared PUBLIC ${IBVERBS_LIBRARY})
 endif()
 
@@ -308,14 +339,12 @@ if(STATIC_LIB)
     set_target_properties(rogue-core-static PROPERTIES OUTPUT_NAME librogue-core)
     set_target_properties(rogue-core-static PROPERTIES PREFIX "" SUFFIX ".a")
 
-    # Link rogue core to boost, python and bzip
     TARGET_LINK_LIBRARIES(rogue-core-static PUBLIC ${Boost_LIBRARIES})
     TARGET_LINK_LIBRARIES(rogue-core-static PUBLIC ${ZeroMQ_LIBRARY})
     TARGET_LINK_LIBRARIES(rogue-core-static PUBLIC ${BZIP2_LIBRARIES})
     TARGET_LINK_LIBRARIES(rogue-core-static PUBLIC ${Python3_LIBRARIES})
 
-    # Link ibverbs into the static library too (Linux only)
-    if (IBVERBS_LIBRARY AND NOT APPLE)
+    if (ROCEV2 AND NOT APPLE)
        TARGET_LINK_LIBRARIES(rogue-core-static PUBLIC ${IBVERBS_LIBRARY})
     endif()
 
@@ -477,10 +506,11 @@ message("")
 message("-- Found Bzip2: ${BZIP2_INCLUDE_DIR}")
 message("")
 
-if (IBVERBS_LIBRARY AND NOT APPLE)
-   message("-- Found libibverbs: ${IBVERBS_LIBRARY} (RoCEv2 enabled)")
+if (ROCEV2)
+   message("-- RoCEv2 support: ENABLED  (-DROCEV2=ON)")
+   message("-- Found libibverbs: ${IBVERBS_LIBRARY}")
 else()
-   message("-- libibverbs not found (RoCEv2 disabled)")
+   message("-- RoCEv2 support: DISABLED (use -DROCEV2=ON to enable)")
 endif()
 
 message("")

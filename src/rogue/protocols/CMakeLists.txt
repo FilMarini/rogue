@@ -9,14 +9,16 @@
 # copied, modified, propagated, or distributed except according to the terms
 # contained in the LICENSE.txt file.
 # ----------------------------------------------------------------------------
-
 add_subdirectory("packetizer")
 add_subdirectory("rssi")
 add_subdirectory("srp")
 add_subdirectory("udp")
 add_subdirectory("batcher")
 add_subdirectory("xilinx")
-add_subdirectory("rocev2")
+
+if (ROCEV2)
+   add_subdirectory("rocev2")
+endif()
 
 if (NOT NO_PYTHON)
    target_sources(rogue-core PRIVATE "${CMAKE_CURRENT_LIST_DIR}/module.cpp")

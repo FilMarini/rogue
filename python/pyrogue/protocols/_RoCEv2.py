@@ -45,8 +45,13 @@ from bitstring import BitStream as _BS
 from typing import Any
 
 import pyrogue as pr
-import rogue.protocols.rocev2
 import rogue.interfaces.stream
+
+try:
+    import rogue.protocols.rocev2
+    _ROCEV2_AVAILABLE = True
+except ImportError:
+    _ROCEV2_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -656,8 +661,8 @@ class RoCEv2Server(pr.Device):
         deviceName:       str,
         ibPort:           int    = 1,
         gidIndex:         int    = 0,
-        maxPayload:       int    = rogue.protocols.rocev2.DefaultMaxPayload,
-        rxQueueDepth:     int    = rogue.protocols.rocev2.DefaultRxQueueDepth,
+        maxPayload:       int    = 9000,
+        rxQueueDepth:     int    = 256,
         roceEngineOffset: int    = 0,
         roceMemBase:      object = None,
         roceEngine:       object = None,
@@ -668,6 +673,11 @@ class RoCEv2Server(pr.Device):
         pollInterval:     int    = 1,
         **kwargs: Any,
     ) -> None:
+        if not _ROCEV2_AVAILABLE:
+            raise ImportError(
+                "RoCEv2Server requires rogue built with -DROCEV2=ON and "
+                "libibverbs installed (conda install -c conda-forge rdma-core)."
+            )
         super().__init__(**kwargs)
 
         self._ip            = ip
